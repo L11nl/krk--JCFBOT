@@ -1,0 +1,24 @@
+{
+  "name": "chatgpt-bot-creator",
+  "version": "2.0.0",
+  "description": "ChatGPT Auto Account Creator",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "npx playwright install chromium --with-deps"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "playwright": "^1.42.1",
+    "axios": "^1.6.7",
+    "@faker-js/faker": "^8.4.1",
+    "dotenv": "^16.4.0",
+    "canvas": "^2.11.2",
+    "sqlite3": "^5.1.7"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

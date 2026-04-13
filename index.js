@@ -339,27 +339,67 @@ function parseCredentials(text) {
   const raw = String(text || '');
   const emailMatch = raw.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
   const urlMatch = raw.match(/https?:\/\/2fa\.[^\s]+|https?:\/\/[^\s]*2fa[^\s]*/i);
-  const lines = raw.split(/\n+/).map(v => v.trim()).filter(Boolean);
-  const ignored = new Set(['تم', 'إنشاء', 'الحساب', 'وتفعيل', 'المصادقة', 'الثنائية', 'بنجاح', 'الإيميل', 'الباسورد', 'رابط']);
+  const labeledPasswordMatch = raw.match(new RegExp('(?:الباسورد|كلمة\\s*المرور|password)\\s*[:：\\-]?\\s*([^\\s\\n]+)', 'i'));
+  const email = emailMatch ? normalizeEmail(emailMatch[0]) : null;
+  const url2fa = urlMatch ? urlMatch[0].trim() : null;
+
   let password = null;
-  const candidates = [];
-  for (const line of lines) {
-    const clean = line.replace(/[\[\]✅🔑📧🔗:،]/g, ' ').trim();
-    if (!clean) continue;
-    const pieces = clean.split(/\s+/).filter(Boolean);
-    for (const p of pieces) {
-      if (/@/.test(p) || /^https?:\/\//i.test(p)) continue;
-      if (/^[\d:/.]+$/.test(p)) continue;
-      if ([...ignored].some(w => p.includes(w))) continue;
-      if (p.length >= 6) candidates.push(p);
+  if (labeledPasswordMatch && labeledPasswordMatch[1]) {
+    const candidate = labeledPasswordMatch[1].trim();
+    if (!/@/.test(candidate) && !/^https?:\/\//i.test(candidate)) password = candidate;
+  }
+
+  const ignoredWords = ['تم', 'إنشاء', 'الحساب', 'وتفعيل', 'المصادقة', 'الثنائية', 'بنجاح', 'الإيميل', 'الباسورد', 'رابط', 'البريد', 'كلمة', 'المرور', 'password', 'email'];
+  const sanitizeLine = (line) => line
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/[✅🔑📧🔗:،|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const isIgnoredToken = (token) => {
+    if (!token) return true;
+    if (/@/.test(token)) return true;
+    if (/^https?:\/\//i.test(token)) return true;
+    if (/^[\d:/.]+$/.test(token)) return true;
+    const lower = token.toLowerCase();
+    return ignoredWords.some(w => lower.includes(String(w).toLowerCase()));
+  };
+
+  const rawWithoutUrl = url2fa ? raw.replace(url2fa, ' ') : raw;
+  const lines = rawWithoutUrl.split(/\n+/).map(sanitizeLine).filter(Boolean);
+
+  if (!password && email) {
+    for (const line of lines) {
+      if (!line.includes(email)) continue;
+      const afterEmail = line.split(email).slice(1).join(' ').trim();
+      if (!afterEmail) continue;
+      const sameLineTokens = afterEmail.split(/\s+/).map(v => v.trim()).filter(Boolean);
+      const sameLinePassword = sameLineTokens.find(t => !isIgnoredToken(t) && t.length >= 3);
+      if (sameLinePassword) {
+        password = sameLinePassword;
+        break;
+      }
     }
   }
-  if (candidates.length) password = candidates.sort((a, b) => b.length - a.length)[0];
-  return {
-    email: emailMatch ? normalizeEmail(emailMatch[0]) : null,
-    password,
-    url2fa: urlMatch ? urlMatch[0].trim() : null
-  };
+
+  if (!password) {
+    const orderedTokens = [];
+    for (const line of lines) {
+      for (const token of line.split(/\s+/).map(v => v.trim()).filter(Boolean)) {
+        orderedTokens.push(token);
+      }
+    }
+    const filtered = orderedTokens.filter(t => !isIgnoredToken(t) && t.length >= 3);
+    if (email) {
+      const emailIndex = orderedTokens.findIndex(t => t === email);
+      if (emailIndex !== -1) {
+        const afterEmailPassword = orderedTokens.slice(emailIndex + 1).find(t => !isIgnoredToken(t) && t.length >= 3);
+        if (afterEmailPassword) password = afterEmailPassword;
+      }
+    }
+    if (!password && filtered.length) password = filtered[0];
+  }
+
+  return { email, password, url2fa };
 }
 
 function getDashboardKeyboard(state, chatId) {

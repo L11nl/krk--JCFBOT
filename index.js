@@ -86,6 +86,120 @@ async function smartWait(page, ms = 1200) {
   ]);
 }
 
+async function waitForAnyVisible(page, selectors, timeout = 12000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    for (const selector of selectors) {
+      try {
+        const loc = page.locator(selector).first();
+        if (await loc.isVisible({ timeout: 300 }).catch(() => false)) return loc;
+      } catch (_) {}
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+async function humanFill(locator, value, delay = 55) {
+  await locator.click({ force: true });
+  try { await locator.fill(''); } catch (_) {}
+  await locator.press('Control+A').catch(() => {});
+  await locator.press('Meta+A').catch(() => {});
+  await locator.press('Backspace').catch(() => {});
+  await locator.type(String(value || ''), { delay });
+}
+
+async function ensureWorkspaceLogin(page, creds, updateStatus) {
+  await updateStatus('1/8 فتح صفحة الدخول');
+  await page.goto('https://chatgpt.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await smartWait(page, 2200);
+
+  try {
+    const loginBtn = page.locator('text="Log in"').first();
+    if (await loginBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await loginBtn.click({ force: true });
+      await smartWait(page, 1800);
+    }
+  } catch (_) {}
+
+  await updateStatus('2/8 انتظار حقل الإيميل');
+  const emailField = await waitForAnyVisible(page, [
+    'input[type="email"]',
+    'input[name="email"]',
+    'input[autocomplete="username"]',
+    'input[autocomplete="email"]'
+  ], 15000);
+  if (!emailField) throw new Error('لم يظهر حقل الإيميل');
+
+  await updateStatus('3/8 كتابة الإيميل بهدوء');
+  await humanFill(emailField, creds.email, 70);
+  await sleep(350);
+  await emailField.press('Enter').catch(() => {});
+  await smartWait(page, 2600);
+
+  await updateStatus('4/8 انتظار حقل الباسورد');
+  const passwordField = await waitForAnyVisible(page, [
+    'input[type="password"]',
+    'input[name="password"]',
+    'input[autocomplete="current-password"]'
+  ], 18000);
+  if (!passwordField) throw new Error('لم يظهر حقل الباسورد');
+
+  await updateStatus('5/8 كتابة الباسورد بهدوء');
+  await humanFill(passwordField, creds.password, 65);
+  await sleep(450);
+  await passwordField.press('Enter').catch(() => {});
+  await smartWait(page, 3200);
+
+  if (creds.url2fa) {
+    await updateStatus('6/8 جلب وإدخال كود 2FA');
+    const mfaPage = await page.context().newPage();
+    await mfaPage.goto(creds.url2fa, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await smartWait(mfaPage, 1200);
+    const bodyText = await mfaPage.innerText('body').catch(() => '');
+    const codeMatch = bodyText.match(/\b\d{3}\s*\d{3}\b/) || bodyText.match(/\b\d{6}\b/);
+    await mfaPage.close().catch(() => {});
+    if (!codeMatch) throw new Error('لم يتم العثور على كود 2FA');
+    const code6 = codeMatch[0].replace(/\s+/g, '');
+    const otpField = await waitForAnyVisible(page, [
+      'input[inputmode="numeric"]',
+      'input[autocomplete="one-time-code"]',
+      'input[name*="code" i]',
+      'input[type="tel"]'
+    ], 12000);
+    if (!otpField) throw new Error('لم يظهر حقل 2FA');
+    await humanFill(otpField, code6, 85);
+    await sleep(450);
+    await otpField.press('Enter').catch(() => {});
+    await smartWait(page, 3500);
+  }
+
+  await updateStatus('7/8 التحقق من نجاح الدخول');
+  const loginStillVisible = await waitForAnyVisible(page, [
+    'input[type="password"]',
+    'input[type="email"]',
+    'input[autocomplete="username"]'
+  ], 2000);
+  if (loginStillVisible) throw new Error('ما زالت صفحة تسجيل الدخول ظاهرة، تحقق من البيانات');
+
+  const currentUrl = page.url();
+  if (/auth\/login|auth0|login/i.test(currentUrl)) {
+    throw new Error('لم يكتمل تسجيل الدخول، ما زلت في صفحة الدخول');
+  }
+
+  await updateStatus('8/8 فتح لوحة الإدارة للتأكد');
+  let ok = false;
+  for (const url of ['https://chatgpt.com/admin/settings', 'https://chatgpt.com/admin/members?tab=members', 'https://chatgpt.com/admin']) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await smartWait(page, 1800);
+      const u = page.url();
+      if (/chatgpt\.com\/admin/i.test(u) && !/auth\/login/i.test(u)) { ok = true; break; }
+    } catch (_) {}
+  }
+  if (!ok) throw new Error('فشل التحقق من لوحة الإدارة بعد تسجيل الدخول');
+}
+
 async function extractAllEmails(page, options = {}) {
   const rounds = options.rounds || 5;
   const pause = options.pause || 500;
@@ -549,52 +663,24 @@ bot.on('message', async (msg) => {
       }
 
       const updateStatus = async (t) => bot.editMessageText(`⏳ ${t}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => {});
-      try {
-        const loginBtn = state.page.locator('text="Log in"').first();
-        if (await loginBtn.isVisible().catch(() => false)) await loginBtn.click({ force: true });
-      } catch (_) {}
-      await updateStatus('1/7 كتابة الإيميل');
-      await state.page.keyboard.type(state.email, { delay: 12 });
-      await state.page.keyboard.press('Enter');
-      await smartWait(state.page, 1400);
-      await updateStatus('2/7 كتابة الباسورد');
-      await state.page.keyboard.type(state.password, { delay: 12 });
-      await state.page.keyboard.press('Enter');
-      await smartWait(state.page, 1800);
+      await ensureWorkspaceLogin(state.page, { email: state.email, password: state.password, url2fa: state.url2fa }, updateStatus);
 
-      if (state.url2fa) {
-        await updateStatus('3/7 جلب كود 2FA');
-        const mfaPage = await safeNewPage(context);
-        await mfaPage.goto(state.url2fa, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await smartWait(mfaPage, 800);
-        const bodyText = await mfaPage.innerText('body').catch(() => '');
-        const codeMatch = bodyText.match(/\b\d{3}\s*\d{3}\b/) || bodyText.match(/\b\d{6}\b/);
-        if (!codeMatch) throw new Error('لم يتم العثور على كود 2FA');
-        const code6 = codeMatch[0].replace(/\s+/g, '');
-        await mfaPage.close().catch(() => {});
-        await state.page.bringToFront();
-        await updateStatus(`4/7 إدخال الكود ${code6}`);
-        await state.page.keyboard.type(code6, { delay: 12 });
-        await state.page.keyboard.press('Enter');
-        await smartWait(state.page, 1800);
-      }
-
-      await updateStatus('5/7 تخطي الإعدادات الأولى');
+      await updateStatus('دخول ناجح، تخطي الإعدادات الأولى بسرعة');
       try {
         const emptyWsBtn = state.page.locator('text="Start as empty workspace"').first();
-        if (await emptyWsBtn.isVisible({ timeout: 2000 }).catch(() => false)) await emptyWsBtn.click({ force: true });
+        if (await emptyWsBtn.isVisible({ timeout: 1500 }).catch(() => false)) await emptyWsBtn.click({ force: true });
       } catch (_) {}
       try {
         const contBtn = state.page.locator('text="Continue"').last();
-        if (await contBtn.isVisible({ timeout: 2000 }).catch(() => false)) await contBtn.click({ force: true });
+        if (await contBtn.isVisible({ timeout: 1500 }).catch(() => false)) await contBtn.click({ force: true });
       } catch (_) {}
-      await smartWait(state.page, 2200);
+      await smartWait(state.page, 1200);
 
-      await updateStatus('6/7 حفظ المساحة في القاعدة');
+      await updateStatus('حفظ المساحة في القاعدة');
       await state.page.goto('https://chatgpt.com/admin/settings', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(async () => {
         await state.page.goto('https://chatgpt.com/admin', { waitUntil: 'domcontentloaded', timeout: 30000 });
       });
-      await smartWait(state.page, 1500);
+      await smartWait(state.page, 1200);
       let wsName = state.email.split('@')[0];
       try {
         const nameInput = state.page.locator('input[type="text"]:not([placeholder*="Search" i]), input[name="name"]').first();

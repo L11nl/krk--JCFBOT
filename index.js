@@ -109,62 +109,85 @@ async function humanFill(locator, value, delay = 55) {
   await locator.type(String(value || ''), { delay });
 }
 
-async function ensureWorkspaceLogin(page, creds, updateStatus) {
+async function sendStagePhoto(chatId, page, caption) {
+  if (!isAdmin(chatId)) return;
+  const p = path.join(os.tmpdir(), `stage_${Date.now()}_${Math.floor(Math.random() * 10000)}.png`);
+  try {
+    await page.screenshot({ path: p, fullPage: false });
+    await bot.sendPhoto(chatId, p, { caption });
+  } catch (_) {
+  } finally {
+    try { fs.unlinkSync(p); } catch (_) {}
+  }
+}
+
+async function ensureWorkspaceLogin(page, creds, updateStatus, chatId) {
   await updateStatus('1/8 فتح صفحة الدخول');
-  await page.goto('https://chatgpt.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await smartWait(page, 2200);
+  await page.goto('https://chatgpt.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await sleep(4000);
+  await sendStagePhoto(chatId, page, 'المرحلة 1: فتح صفحة تسجيل الدخول');
 
   try {
-    const loginBtn = page.locator('text="Log in"').first();
-    if (await loginBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-      await loginBtn.click({ force: true });
-      await smartWait(page, 1800);
+    const cfBox = page.frameLocator('iframe').locator('.ctp-checkbox-label, input[type="checkbox"]').first();
+    if (await cfBox.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await cfBox.click({ force: true });
+      await sleep(5000);
+      await sendStagePhoto(chatId, page, 'تم التعامل مع فحص الحماية');
     }
   } catch (_) {}
 
-  await updateStatus('2/8 انتظار حقل الإيميل');
+  try {
+    const loginBtn = page.locator('text="Log in"').first();
+    if (await loginBtn.isVisible({ timeout: 2500 }).catch(() => false)) {
+      await loginBtn.click({ force: true });
+      await sleep(2000);
+      await sendStagePhoto(chatId, page, 'المرحلة 2: بعد الضغط على Log in');
+    }
+  } catch (_) {}
+
+  await updateStatus('2/8 كتابة الإيميل');
   const emailField = await waitForAnyVisible(page, [
     'input[type="email"]',
     'input[name="email"]',
     'input[autocomplete="username"]',
     'input[autocomplete="email"]'
-  ], 15000);
-  if (!emailField) throw new Error('لم يظهر حقل الإيميل');
+  ], 20000);
+  if (emailField) await humanFill(emailField, creds.email, 50);
+  else await page.keyboard.type(creds.email, { delay: 50 });
+  await sleep(500);
+  await sendStagePhoto(chatId, page, `المرحلة 3: تم إدخال الإيميل ${creds.email}`);
+  await page.keyboard.press('Enter').catch(() => {});
 
-  await updateStatus('3/8 كتابة الإيميل بهدوء');
-  await humanFill(emailField, creds.email, 70);
-  await sleep(350);
-  await emailField.press('Enter').catch(() => {});
-  await smartWait(page, 2600);
-
-  await updateStatus('4/8 انتظار حقل الباسورد');
+  await updateStatus('3/8 كتابة الباسورد');
+  await sleep(5000);
   const passwordField = await waitForAnyVisible(page, [
     'input[type="password"]',
     'input[name="password"]',
     'input[autocomplete="current-password"]'
-  ], 18000);
-  if (!passwordField) throw new Error('لم يظهر حقل الباسورد');
+  ], 12000);
+  if (passwordField) await humanFill(passwordField, creds.password, 50);
+  else await page.keyboard.type(creds.password, { delay: 50 });
+  await sleep(500);
+  await sendStagePhoto(chatId, page, `المرحلة 4: تم إدخال الباسورد ${creds.password}`);
+  await page.keyboard.press('Enter').catch(() => {});
 
-  await updateStatus('5/8 كتابة الباسورد بهدوء');
-  await humanFill(passwordField, creds.password, 65);
-  await sleep(450);
-  await passwordField.press('Enter').catch(() => {});
-  await smartWait(page, 3200);
-
+  let code6 = null;
   if (creds.url2fa) {
-    await updateStatus('6/8 فحص طلب 2FA');
+    await updateStatus('4/8 جلب كود 2FA');
     const mfaPage = await page.context().newPage();
-    await mfaPage.goto(creds.url2fa, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await smartWait(mfaPage, 1200);
-    const bodyText = await mfaPage.innerText('body').catch(() => '');
-    const codeMatch = bodyText.match(/\b\d{3}\s*\d{3}\b/) || bodyText.match(/\b\d{6}\b/);
+    await mfaPage.goto(creds.url2fa, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await sleep(3000);
+    const body = await mfaPage.innerText('body').catch(() => '');
+    const codeMatch = body.match(/\d{3}\s*\d{3}/) || body.match(/\d{6}/);
     await mfaPage.close().catch(() => {});
     if (!codeMatch) throw new Error('لم يتم العثور على كود 2FA');
-    const code6 = codeMatch[0].replace(/\s+/g, '');
+    code6 = codeMatch[0].replace(/\s+/g, '');
+  }
 
-    const currentAfterPassword = page.url();
-    const maybeLoggedInWithoutOtp = !/auth\/login|auth0|login/i.test(currentAfterPassword);
-
+  if (code6) {
+    await updateStatus('5/8 إدخال كود 2FA');
+    await sleep(4000);
+    await sendStagePhoto(chatId, page, `المرحلة 5: قبل إدخال كود 2FA ${code6}`);
     const otpField = await waitForAnyVisible(page, [
       'input[autocomplete="one-time-code"]',
       'input[name*="otp" i]',
@@ -173,56 +196,44 @@ async function ensureWorkspaceLogin(page, creds, updateStatus) {
       'input[inputmode="numeric"]',
       'input[type="tel"]',
       'input[maxlength="6"]'
-    ], 18000);
-
+    ], 15000);
     if (otpField) {
-      await updateStatus('6/8 إدخال كود 2FA');
       const otpInputs = page.locator('input[inputmode="numeric"], input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="totp" i], input[name*="code" i], input[type="tel"], input[maxlength="1"]');
       const otpCount = await otpInputs.count().catch(() => 0);
       if (otpCount >= 6) {
         for (let i = 0; i < 6; i++) {
           const cell = otpInputs.nth(i);
-          if (await cell.isVisible({ timeout: 500 }).catch(() => false)) {
-            await humanFill(cell, code6[i], 90);
+          if (await cell.isVisible({ timeout: 300 }).catch(() => false)) {
+            await cell.fill(code6[i]).catch(async () => { await cell.type(code6[i], { delay: 30 }); });
           }
         }
       } else {
-        await humanFill(otpField, code6, 85);
+        await humanFill(otpField, code6, 50);
       }
-      await sleep(500);
-      await otpField.press('Enter').catch(() => {});
-      await smartWait(page, 3500);
-    } else if (!maybeLoggedInWithoutOtp) {
-      throw new Error('لم يظهر حقل 2FA ولم يكتمل الدخول');
+    } else {
+      await page.keyboard.type(code6, { delay: 50 });
     }
+    await sleep(500);
+    await sendStagePhoto(chatId, page, `المرحلة 6: بعد إدخال كود 2FA ${code6}`);
+    await page.keyboard.press('Enter').catch(() => {});
   }
 
-  await updateStatus('7/8 التحقق من نجاح الدخول');
-  const loginStillVisible = await waitForAnyVisible(page, [
-    'input[type="password"]',
-    'input[type="email"]',
-    'input[autocomplete="username"]'
-  ], 2000);
-  if (loginStillVisible) throw new Error('ما زالت صفحة تسجيل الدخول ظاهرة، تحقق من البيانات');
+  await updateStatus('6/8 انتظار اكتمال الدخول');
+  await sleep(5000);
+  await sendStagePhoto(chatId, page, 'المرحلة 7: بعد محاولة تسجيل الدخول');
 
-  const currentUrl = page.url();
-  if (/auth\/login|auth0|login/i.test(currentUrl)) {
-    throw new Error('لم يكتمل تسجيل الدخول، ما زلت في صفحة الدخول');
-  }
-
-  await updateStatus('8/8 فتح لوحة الإدارة للتأكد');
   let ok = false;
-  for (const url of ['https://chatgpt.com/admin/settings', 'https://chatgpt.com/admin/members?tab=members', 'https://chatgpt.com/admin']) {
+  for (const u of ['https://chatgpt.com/admin/settings', 'https://chatgpt.com/admin', 'https://chatgpt.com/admin/members?tab=members']) {
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await smartWait(page, 1800);
-      const u = page.url();
-      if (/chatgpt\.com\/admin/i.test(u) && !/auth\/login/i.test(u)) { ok = true; break; }
+      await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await sleep(5000);
+      const current = page.url();
+      if (/chatgpt\.com\/admin/i.test(current) && !/auth\/login/i.test(current)) { ok = true; break; }
     } catch (_) {}
   }
-  if (!ok) throw new Error('فشل التحقق من لوحة الإدارة بعد تسجيل الدخول');
+  if (!ok) throw new Error('فشل تسجيل الدخول الحقيقي: لم يتم الوصول إلى لوحة admin');
+  await sendStagePhoto(chatId, page, 'المرحلة 8: تم الوصول إلى لوحة admin بنجاح');
 }
-
 async function extractAllEmails(page, options = {}) {
   const rounds = options.rounds || 5;
   const pause = options.pause || 500;
@@ -637,7 +648,73 @@ bot.on('callback_query', async (query) => {
   }
   if (data === 'ws_computer_mode') {
     if (!isAdmin(chatId)) return bot.sendMessage(chatId, '❌ هذا الخيار للأدمن فقط.');
+    state.step = 'interactive_menu';
     return sendInteractiveMenu(chatId, '🖥️ تم فتح وضع الكمبيوتر لهذه الجلسة.');
+  }
+  if (!isAdmin(chatId)) return;
+  if (data === 'int_goto_url') {
+    state.step = 'int_awaiting_url';
+    return bot.sendMessage(chatId, 'أرسل الرابط الذي تريد فتحه:');
+  }
+  if (data === 'int_type_text') {
+    state.step = 'int_awaiting_text';
+    return bot.sendMessage(chatId, 'أرسل النص الذي تريد كتابته:');
+  }
+  if (data === 'int_press_enter') {
+    if (!state.page) return bot.sendMessage(chatId, '❌ لا توجد صفحة نشطة الآن.');
+    await state.page.keyboard.press('Enter').catch(() => {});
+    await sleep(1200);
+    await sendStagePhoto(chatId, state.page, 'تم الضغط على Enter');
+    return;
+  }
+  if (data === 'int_refresh') {
+    if (!state.page) return bot.sendMessage(chatId, '❌ لا توجد صفحة نشطة الآن.');
+    await sendStagePhoto(chatId, state.page, 'تحديث الشاشة الحالية');
+    return;
+  }
+  if (data === 'int_show_grid') {
+    if (!state.page) return bot.sendMessage(chatId, '❌ لا توجد صفحة نشطة الآن.');
+    await sendStagePhoto(chatId, state.page, 'هذه الشاشة الحالية لوضع الكمبيوتر');
+    return;
+  }
+  if (data === 'int_finish_login') {
+    if (!state.page || !state.context || !state.profileDir || !state.email) return bot.sendMessage(chatId, '❌ لا توجد جلسة تسجيل يدوي مكتملة.');
+    const statusMsg = await bot.sendMessage(chatId, '⏳ جاري حفظ جلسة التسجيل اليدوي...');
+    try {
+      let ok = false;
+      for (const u of ['https://chatgpt.com/admin/settings', 'https://chatgpt.com/admin', 'https://chatgpt.com/admin/members?tab=members']) {
+        try {
+          await state.page.goto(u, { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await sleep(4000);
+          const current = state.page.url();
+          if (/chatgpt\.com\/admin/i.test(current) && !/auth\/login/i.test(current)) { ok = true; break; }
+        } catch (_) {}
+      }
+      if (!ok) throw new Error('لم تكتمل عملية الدخول اليدوي بعد');
+      let wsName = state.email.split('@')[0];
+      try {
+        const nameInput = state.page.locator('input[type="text"]:not([placeholder*="Search" i]), input[name="name"]').first();
+        if (await nameInput.isVisible().catch(() => false)) wsName = (await nameInput.inputValue().catch(() => '')) || wsName;
+      } catch (_) {}
+      const insertedId = await dbRun('INSERT INTO workspaces (chat_id, name, email, password, url2fa, profile_dir) VALUES (?, ?, ?, ?, ?, ?)', [chatId, wsName, state.email, state.password, state.url2fa || '', state.profileDir]);
+      activeContexts[insertedId] = state.context;
+      state.context.on('close', () => { delete activeContexts[insertedId]; });
+      await rememberAllowedEmail(insertedId, state.email);
+      const info = await getWorkspaceOccupancy({ id: insertedId, profile_dir: state.profileDir });
+      for (const e of [...new Set([...info.members, ...info.invites])]) await rememberAllowedEmail(insertedId, e);
+      await sendStagePhoto(chatId, state.page, 'تم حفظ المساحة بعد التسجيل اليدوي بنجاح');
+      await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+      state.currentWsId = insertedId;
+      state.step = null;
+      state.page = null;
+      state.context = null;
+      state.credentialBuffer = '';
+      return bot.sendMessage(chatId, `✅ تمت إضافة المساحة بنجاح
+المساحة: ${wsName}`, { reply_markup: { inline_keyboard: getDashboardKeyboard(state, chatId) } });
+    } catch (e) {
+      await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+      return bot.sendMessage(chatId, `❌ فشل إنهاء التسجيل اليدوي: ${e.message}`);
+    }
   }
 });
 
@@ -686,7 +763,7 @@ bot.on('message', async (msg) => {
       }
 
       const updateStatus = async (t) => bot.editMessageText(`⏳ ${t}`, { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => {});
-      await ensureWorkspaceLogin(state.page, { email: state.email, password: state.password, url2fa: state.url2fa }, updateStatus);
+      await ensureWorkspaceLogin(state.page, { email: state.email, password: state.password, url2fa: state.url2fa }, updateStatus, chatId);
 
       await updateStatus('دخول ناجح، تخطي الإعدادات الأولى بسرعة');
       try {
@@ -738,6 +815,34 @@ bot.on('message', async (msg) => {
       state.step = 'awaiting_credentials';
       return bot.sendMessage(chatId, `❌ فشل التنفيذ: ${error.message}`);
     }
+  }
+
+  if (state.step === 'int_awaiting_url') {
+    if (!isAdmin(chatId) || !state.page) return bot.sendMessage(chatId, '❌ لا توجد صفحة نشطة الآن.');
+    state.step = 'interactive_menu';
+    let url = text;
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+    try {
+      await state.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await sleep(2000);
+      await sendStagePhoto(chatId, state.page, `تم فتح الرابط: ${url}`);
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ فشل فتح الرابط: ${e.message}`);
+    }
+    return;
+  }
+
+  if (state.step === 'int_awaiting_text') {
+    if (!isAdmin(chatId) || !state.page) return bot.sendMessage(chatId, '❌ لا توجد صفحة نشطة الآن.');
+    state.step = 'interactive_menu';
+    try {
+      await state.page.keyboard.type(text, { delay: 45 });
+      await sleep(800);
+      await sendStagePhoto(chatId, state.page, `تمت كتابة النص: ${text}`);
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ فشل كتابة النص: ${e.message}`);
+    }
+    return;
   }
 
   if (!state.currentWsId || !state.step) return;

@@ -152,7 +152,7 @@ async function ensureWorkspaceLogin(page, creds, updateStatus) {
   await smartWait(page, 3200);
 
   if (creds.url2fa) {
-    await updateStatus('6/8 جلب وإدخال كود 2FA');
+    await updateStatus('6/8 فحص طلب 2FA');
     const mfaPage = await page.context().newPage();
     await mfaPage.goto(creds.url2fa, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await smartWait(mfaPage, 1200);
@@ -161,17 +161,40 @@ async function ensureWorkspaceLogin(page, creds, updateStatus) {
     await mfaPage.close().catch(() => {});
     if (!codeMatch) throw new Error('لم يتم العثور على كود 2FA');
     const code6 = codeMatch[0].replace(/\s+/g, '');
+
+    const currentAfterPassword = page.url();
+    const maybeLoggedInWithoutOtp = !/auth\/login|auth0|login/i.test(currentAfterPassword);
+
     const otpField = await waitForAnyVisible(page, [
-      'input[inputmode="numeric"]',
       'input[autocomplete="one-time-code"]',
+      'input[name*="otp" i]',
+      'input[name*="totp" i]',
       'input[name*="code" i]',
-      'input[type="tel"]'
-    ], 12000);
-    if (!otpField) throw new Error('لم يظهر حقل 2FA');
-    await humanFill(otpField, code6, 85);
-    await sleep(450);
-    await otpField.press('Enter').catch(() => {});
-    await smartWait(page, 3500);
+      'input[inputmode="numeric"]',
+      'input[type="tel"]',
+      'input[maxlength="6"]'
+    ], 18000);
+
+    if (otpField) {
+      await updateStatus('6/8 إدخال كود 2FA');
+      const otpInputs = page.locator('input[inputmode="numeric"], input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="totp" i], input[name*="code" i], input[type="tel"], input[maxlength="1"]');
+      const otpCount = await otpInputs.count().catch(() => 0);
+      if (otpCount >= 6) {
+        for (let i = 0; i < 6; i++) {
+          const cell = otpInputs.nth(i);
+          if (await cell.isVisible({ timeout: 500 }).catch(() => false)) {
+            await humanFill(cell, code6[i], 90);
+          }
+        }
+      } else {
+        await humanFill(otpField, code6, 85);
+      }
+      await sleep(500);
+      await otpField.press('Enter').catch(() => {});
+      await smartWait(page, 3500);
+    } else if (!maybeLoggedInWithoutOtp) {
+      throw new Error('لم يظهر حقل 2FA ولم يكتمل الدخول');
+    }
   }
 
   await updateStatus('7/8 التحقق من نجاح الدخول');

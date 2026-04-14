@@ -2224,20 +2224,46 @@ ${text}`);
             state.step = null; return;
         }
         if (state.step === 'ws_awaiting_revoke_invite') {
-            state.step = 'processing'; let statusMsg = await bot.sendMessage(chatId, '⏳ جاري إلغاء الدعوة...');
+            state.step = 'processing'; let visualLine = `ــــــــــــــــــــــــــــــــــــــــــــــــــــــــــــــ
+ ${textInput}                                ... 
+ـــــــــــــــــــــــــــــــــــــــــــــــــــــــــــــ`;
+            let statusMsg = await bot.sendMessage(chatId, `${visualLine}
+
+⏳ جاري تطبيق المنطق الهندسي للبحث والضغط...`);
             try {
                 if (await isTrader(chatId)) { const own = await canTraderManageEmail(chatId, textInput); if (!own) { state.step = null; await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {}); return bot.sendMessage(chatId, '❌ لا يمكنك إلغاء دعوة لم تضفها أنت.'); } }
-                const ws = await dbGet('SELECT * FROM workspaces WHERE id = ?', [wsId]); if (!ws) throw new Error('المساحة غير موجودة.'); let ok = false; const context = await getContext(ws.id, ws.profile_dir); const page = await context.newPage(); await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900); if (await workspaceLooksLoggedOut(page)) { const relogin = await tryRestoreWorkspaceSession(ws, 'manual_revoke'); if (!relogin.ok) { await page.close().catch(() => {}); throw new Error('تم تسجيل خروج من هذه المساحة وفشل البوت في إرجاع الدخول لها.'); } await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900); } if (await dynamicGeometryAction(page, textInput, 'revoke')) { ok = true; await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [ws.id, normalizeEmail(textInput)]); await markTraderEmailStatus(chatId, textInput, 'revoked').catch(() => {}); const stats = await getWorkspaceStats(ws.id); const invites = String(stats.last_known_invites || '').split('\n').map(normalizeEmail).filter(v => v && v !== normalizeEmail(textInput)); await setWorkspaceStats(ws.id, { invite_count: Math.max(0, invites.length), last_known_invites: invites.join('\n'), last_synced_at: nowIso() }); await sendAdminActorNotification('تم إلغاء دعوة', chatId, ws.name, normalizeEmail(textInput)); } await page.close().catch(() => {});
-                await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {}); if (ok) { if (await isTrader(chatId)) await markTraderEmailStatus(chatId, textInput, 'revoked'); await bot.sendMessage(chatId, `✅ تم إلغاء الدعوة بنجاح لـ: ${textInput}`); await pushUpdatedWorkspaceMenu(chatId, '✅ تم تحديث عداد جميع المساحات بعد إلغاء الدعوة.'); } else bot.sendMessage(chatId, '❌ لم يتم العثور على الإيميل في الدعوات المعلقة أو فشل الإجراء.');
+                const context = await getContext(wsId, (await dbGet('SELECT profile_dir FROM workspaces WHERE id = ?', [wsId])).profile_dir); const page = await context.newPage();
+                await page.goto("https://chatgpt.com/admin/members?tab=invites", { waitUntil: "domcontentloaded", timeout: 45000 }); await sleep(5000);
+                if (await dynamicGeometryAction(page, textInput, 'revoke')) {
+                    await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [wsId, normalizeEmail(textInput)]);
+                    await markTraderEmailStatus(chatId, textInput, 'revoked').catch(() => {});
+                    bot.sendMessage(chatId, `✅ تم الضغط بدقة هندسية وإلغاء الدعوة بنجاح لـ: ${textInput}
+(اضغط 🔁 لتحديث الشاشة)`);
+                    await pushUpdatedWorkspaceMenu(chatId, '✅ تم تحديث عداد جميع المساحات بعد إلغاء الدعوة.').catch(() => {});
+                } else { bot.sendMessage(chatId, `❌ لم يتم العثور على الإيميل في الدعوات المعلقة (Pending invites) أو فشل الإجراء.`); }
+                await bot.deleteMessage(chatId, statusMsg.message_id).catch(()=>{}); await page.close();
             } catch (error) { bot.sendMessage(chatId, `❌ خطأ: ${error.message}`); }
             state.step = null; return;
         }
         if (state.step === 'ws_awaiting_remove_member') {
-            state.step = 'processing'; let statusMsg = await bot.sendMessage(chatId, '⏳ جاري إزالة العضو...');
+            state.step = 'processing'; let visualLine = `ــــــــــــــــــــــــــــــــــــــــــــــــــــــــــــــ
+ ${textInput}                                ... 
+ـــــــــــــــــــــــــــــــــــــــــــــــــــــــــــــ`;
+            let statusMsg = await bot.sendMessage(chatId, `${visualLine}
+
+⏳ جاري تطبيق المنطق الهندسي للبحث والضغط...`);
             try {
                 if (await isTrader(chatId)) { const own = await canTraderManageEmail(chatId, textInput); if (!own) { state.step = null; await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {}); return bot.sendMessage(chatId, '❌ لا يمكنك إزالة عضو لم تضفه أنت.'); } }
-                const ws = await dbGet('SELECT * FROM workspaces WHERE id = ?', [wsId]); if (!ws) throw new Error('المساحة غير موجودة.'); let ok = false; const context = await getContext(ws.id, ws.profile_dir); const page = await context.newPage(); await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900); if (await workspaceLooksLoggedOut(page)) { const relogin = await tryRestoreWorkspaceSession(ws, 'manual_remove'); if (!relogin.ok) { await page.close().catch(() => {}); throw new Error('تم تسجيل خروج من هذه المساحة وفشل البوت في إرجاع الدخول لها.'); } await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900); } if (await dynamicGeometryAction(page, textInput, 'remove')) { ok = true; await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [ws.id, normalizeEmail(textInput)]); await markTraderEmailStatus(chatId, textInput, 'removed').catch(() => {}); const stats = await getWorkspaceStats(ws.id); const members = String(stats.last_known_emails || '').split('\n').map(normalizeEmail).filter(v => v && v !== normalizeEmail(textInput)); await setWorkspaceStats(ws.id, { member_count: Math.max(0, members.length), last_known_emails: members.join('\n'), last_synced_at: nowIso() }); if (await isTrader(chatId)) { const own = await canTraderManageEmail(chatId, textInput); if (own && own.added_at && (Date.now() - new Date(own.added_at).getTime()) >= (40 * 60 * 60 * 1000)) { await reserveTraderSeat(chatId, ws.id, textInput, 40); } } await sendAdminActorNotification('تمت إزالة عضو', chatId, ws.name, normalizeEmail(textInput)); } await page.close().catch(() => {});
-                await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {}); if (ok) { if (await isTrader(chatId)) await markTraderEmailStatus(chatId, textInput, 'removed'); await bot.sendMessage(chatId, `✅ تمت إزالة العضو نهائياً: ${textInput}`); await pushUpdatedWorkspaceMenu(chatId, '✅ تم تحديث عداد جميع المساحات بعد إزالة العضو.'); } else bot.sendMessage(chatId, '❌ لم يتم العثور على الإيميل في قائمة الأعضاء النشطين أو فشل الإجراء.');
+                const context = await getContext(wsId, (await dbGet('SELECT profile_dir FROM workspaces WHERE id = ?', [wsId])).profile_dir); const page = await context.newPage();
+                await page.goto("https://chatgpt.com/admin/members?tab=members", { waitUntil: "domcontentloaded", timeout: 45000 }); await sleep(5000);
+                if (await dynamicGeometryAction(page, textInput, 'remove')) {
+                    await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [wsId, normalizeEmail(textInput)]);
+                    await markTraderEmailStatus(chatId, textInput, 'removed').catch(() => {});
+                    bot.sendMessage(chatId, `✅ تم الضغط بدقة هندسية وتمت إزالة العضو نهائياً: ${textInput}
+(اضغط 🔁 لتحديث الشاشة)`);
+                    await pushUpdatedWorkspaceMenu(chatId, '✅ تم تحديث عداد جميع المساحات بعد إزالة العضو.').catch(() => {});
+                } else { bot.sendMessage(chatId, `❌ لم يتم العثور على الإيميل في قائمة الأعضاء النشطين (Users) أو فشل الإجراء.`); }
+                await bot.deleteMessage(chatId, statusMsg.message_id).catch(()=>{}); await page.close();
             } catch (error) { bot.sendMessage(chatId, `❌ خطأ: ${error.message}`); }
             state.step = null; return;
         }

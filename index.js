@@ -1237,19 +1237,116 @@ async function emailExistsInWorkspace(page, email) {
 }
 
 async function inviteEmailOnPage(page, email) {
-    const inviteBtn = page.locator('button:has-text("Invite member"), button:has-text("Invite members")').first();
-    if (!(await inviteBtn.isVisible({ timeout: 6000 }).catch(() => false))) throw new Error('زر الدعوة غير ظاهر');
-    await inviteBtn.click({ force: true });
-    await sleep(900);
-    const input = page.locator('input[type="email"], textarea[placeholder*="email" i], input[placeholder*="email" i]').first();
-    if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) throw new Error('حقل الإيميل غير ظاهر');
+    const inviteSelectors = [
+        'button:has-text("Invite member")',
+        'button:has-text("Invite members")',
+        '[role="button"]:has-text("Invite member")',
+        '[role="button"]:has-text("Invite members")',
+        'button:has-text("Invite")',
+        '[role="button"]:has-text("Invite")',
+        'button[aria-label*="invite" i]',
+        '[role="button"][aria-label*="invite" i]'
+    ];
+
+    let inviteBtn = null;
+    for (const sel of inviteSelectors) {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible({ timeout: 1200 }).catch(() => false)) {
+            inviteBtn = loc;
+            break;
+        }
+    }
+
+    if (!inviteBtn) {
+        const inviteCoords = await page.evaluate(() => {
+            const nodes = Array.from(document.querySelectorAll('button, [role="button"], a')).filter(el => {
+                const rect = el.getBoundingClientRect();
+                const txt = (el.innerText || el.getAttribute('aria-label') || '').trim();
+                return rect.width > 0 && rect.height > 0 && /invite/i.test(txt);
+            });
+            if (!nodes.length) return null;
+            const target = nodes.sort((a, b) => {
+                const ar = a.getBoundingClientRect();
+                const br = b.getBoundingClientRect();
+                return (br.width * br.height) - (ar.width * ar.height);
+            })[0];
+            const r = target.getBoundingClientRect();
+            return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        }).catch(() => null);
+
+        if (inviteCoords) {
+            await humanMoveAndClick(page, inviteCoords.x, inviteCoords.y, { steps: 28, jitter: 0.8 });
+        } else {
+            throw new Error('زر الدعوة غير ظاهر');
+        }
+    } else {
+        await inviteBtn.scrollIntoViewIfNeeded().catch(() => {});
+        await inviteBtn.click({ force: true });
+    }
+
+    await sleep(1100);
+
+    const inputSelectors = [
+        'input[type="email"]',
+        'textarea[placeholder*="email" i]',
+        'input[placeholder*="email" i]',
+        'input[autocomplete="email"]',
+        '[role="dialog"] input',
+        '[role="dialog"] textarea'
+    ];
+    let input = null;
+    for (const sel of inputSelectors) {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible({ timeout: 1200 }).catch(() => false)) {
+            input = loc;
+            break;
+        }
+    }
+    if (!input) throw new Error('حقل الإيميل غير ظاهر');
     await input.click({ force: true });
     await page.keyboard.type(email, { delay: typeDelay(30) });
-    await sleep(350);
-    const sendBtn = page.locator('button:has-text("Send invites"), button:has-text("Send invite")').first();
-    if (!(await sendBtn.isVisible({ timeout: 5000 }).catch(() => false))) throw new Error('زر الإرسال غير ظاهر');
-    await sendBtn.click({ force: true });
-    await sleep(1600);
+    await sleep(500);
+
+    const sendSelectors = [
+        'button:has-text("Send invites")',
+        'button:has-text("Send invite")',
+        '[role="button"]:has-text("Send invites")',
+        '[role="button"]:has-text("Send invite")',
+        'button:has-text("Send")',
+        '[role="button"]:has-text("Send")'
+    ];
+    let sendBtn = null;
+    for (const sel of sendSelectors) {
+        const loc = page.locator(sel).last();
+        if (await loc.isVisible({ timeout: 1000 }).catch(() => false)) {
+            sendBtn = loc;
+            break;
+        }
+    }
+
+    if (!sendBtn) {
+        const sendCoords = await page.evaluate(() => {
+            const dialog = Array.from(document.querySelectorAll('[role="dialog"]')).pop() || document.body;
+            const nodes = Array.from(dialog.querySelectorAll('button, [role="button"], a')).filter(el => {
+                const rect = el.getBoundingClientRect();
+                const txt = (el.innerText || el.getAttribute('aria-label') || '').trim();
+                return rect.width > 0 && rect.height > 0 && /send/i.test(txt);
+            });
+            if (!nodes.length) return null;
+            const target = nodes[nodes.length - 1];
+            const r = target.getBoundingClientRect();
+            return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        }).catch(() => null);
+        if (sendCoords) {
+            await humanMoveAndClick(page, sendCoords.x, sendCoords.y, { steps: 24, jitter: 0.6 });
+        } else {
+            await page.keyboard.press('Enter').catch(() => {});
+        }
+    } else {
+        await sendBtn.click({ force: true });
+    }
+
+    await sleep(1800);
 }
 
 async function addEmailIntoAvailableWorkspace(actorChatId, email, opts = {}) {

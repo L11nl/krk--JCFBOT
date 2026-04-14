@@ -206,6 +206,13 @@ async function runMigrations() {
         if (!uaNames.has('telegram_first_name')) await dbRun('ALTER TABLE user_access ADD COLUMN telegram_first_name TEXT DEFAULT ""');
         if (!uaNames.has('telegram_last_name')) await dbRun('ALTER TABLE user_access ADD COLUMN telegram_last_name TEXT DEFAULT ""');
         if (!uaNames.has('phone_number')) await dbRun('ALTER TABLE user_access ADD COLUMN phone_number TEXT DEFAULT ""');
+
+        const maCols = await dbAll("PRAGMA table_info(member_additions)");
+        const maNames = new Set(maCols.map(c => c.name));
+        if (!maNames.has('last_pending_reminder_at')) await dbRun('ALTER TABLE member_additions ADD COLUMN last_pending_reminder_at TEXT DEFAULT ""');
+        if (!maNames.has('approved_notified_at')) await dbRun('ALTER TABLE member_additions ADD COLUMN approved_notified_at TEXT DEFAULT ""');
+
+        await dbRun("UPDATE member_additions SET status = 'cleared', settled = 1 WHERE actor_role = 'trader' AND status IN ('removed','revoked')");
     } catch (e) {}
 }
 setTimeout(() => { runMigrations().catch(() => {}); }, 0);
@@ -601,8 +608,8 @@ async function sendTraderStatsCards(chatId) {
     const rows = await dbAll(`SELECT ua.chat_id, ua.real_name, ua.telegram_username,
         COUNT(ma.id) AS total_added,
         SUM(CASE WHEN ma.settled = 0 AND ma.status IN ('pending','member','migrated') THEN 1 ELSE 0 END) AS active_debt,
-        SUM(CASE WHEN ma.status = 'removed' THEN 1 ELSE 0 END) AS removed_count,
-        SUM(CASE WHEN ma.status = 'revoked' THEN 1 ELSE 0 END) AS revoked_count
+        SUM(CASE WHEN ma.status = 'removed' AND COALESCE(ma.settled, 0) = 0 THEN 1 ELSE 0 END) AS removed_count,
+        SUM(CASE WHEN ma.status = 'revoked' AND COALESCE(ma.settled, 0) = 0 THEN 1 ELSE 0 END) AS revoked_count
         FROM user_access ua
         LEFT JOIN member_additions ma ON ma.actor_chat_id = ua.chat_id AND ma.actor_role = 'trader'
         WHERE ua.role = 'trader'
@@ -778,8 +785,90 @@ async function canTraderManageEmail(chatId, email) {
 async function markTraderEmailStatus(chatId, email, nextStatus) {
     const row = await canTraderManageEmail(chatId, email);
     if (!row) return false;
+    const normalizedNext = String(nextStatus || '').toLowerCase();
+    if (normalizedNext === 'removed' || normalizedNext === 'revoked') {
+        await dbRun('UPDATE member_additions SET status = ?, settled = 1 WHERE id = ?', ['cleared', row.id]);
+        return true;
+    }
     await dbRun('UPDATE member_additions SET status = ? WHERE id = ?', [nextStatus, row.id]);
     return true;
+}
+
+async function getTraderWorkspaceEmailsByStatus(traderChatId, workspaceId) {
+    const rows = await dbAll(`SELECT email, status FROM member_additions WHERE actor_chat_id = ? AND actor_role = 'trader' AND workspace_id = ? AND status IN ('pending','member','migrated') ORDER BY id DESC`, [String(traderChatId), workspaceId]);
+    const uniq = [...new Set(rows.map(r => normalizeEmail(r.email)).filter(Boolean))];
+    return uniq;
+}
+
+async function sendTraderWorkspaceOwnEmails(chatId, wsId) {
+    const ws = await dbGet('SELECT * FROM workspaces WHERE id = ?', [wsId]);
+    if (!ws) return await bot.sendMessage(chatId, '❌ المساحة غير موجودة.');
+    const ownEmails = await getTraderWorkspaceEmailsByStatus(chatId, wsId);
+    if (!ownEmails.length) {
+        return await bot.sendMessage(chatId, `لا توجد إيميلات لك داخل هذه المساحة حالياً.
+المساحة: ${ws.name}`);
+    }
+    const context = await getContext(wsId, ws.profile_dir);
+    const page = await context.newPage();
+    try {
+        await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await sleep(4000);
+        const members = await extractAllEmails(page);
+        await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await sleep(4000);
+        const invites = await extractAllEmails(page);
+        const memberSet = new Set(members.map(normalizeEmail));
+        const inviteSet = new Set(invites.map(normalizeEmail));
+        const owner = normalizeEmail(ws.email);
+        const ownPending = ownEmails.filter(e => inviteSet.has(e) && e !== owner);
+        const ownMembers = ownEmails.filter(e => memberSet.has(e) && e !== owner);
+        const lines = [
+            `🏢 المساحة: ${ws.name}`,
+            '',
+            'ايميلات الذي تم دعوتهم ووافقوا واصبحوا في Users:',
+            ownMembers.length ? ownMembers.join('\n') : 'لا يوجد',
+            '',
+            'ايميلات الذي في Pending invites:',
+            ownPending.length ? ownPending.join('\n') : 'لا يوجد'
+        ];
+        await bot.sendMessage(chatId, lines.join('\n'));
+    } finally {
+        await page.close().catch(() => {});
+    }
+}
+
+async function reconcileTraderRecordsForWorkspace(ws, members = [], invites = []) {
+    const memberSet = new Set((members || []).map(normalizeEmail).filter(Boolean));
+    const inviteSet = new Set((invites || []).map(normalizeEmail).filter(Boolean));
+    const rows = await dbAll(`SELECT * FROM member_additions WHERE workspace_id = ? AND actor_role = 'trader' AND status IN ('pending','member') ORDER BY id ASC`, [ws.id]);
+    const now = Date.now();
+    for (const row of rows) {
+        const email = normalizeEmail(row.email);
+        if (!email) continue;
+        if (memberSet.has(email)) {
+            if (String(row.status) !== 'member') {
+                await dbRun('UPDATE member_additions SET status = ?, approved_notified_at = ? WHERE id = ?', ['member', nowIso(), row.id]);
+                await bot.sendMessage(String(row.actor_chat_id), `لقد وافق المستخدم على الدعوة وتم تفعيله
+
+اسم المساحة: ${ws.name}
+ايميل المستخدم: ${email}`).catch(() => {});
+            } else if (!row.approved_notified_at) {
+                await dbRun('UPDATE member_additions SET approved_notified_at = ? WHERE id = ?', [nowIso(), row.id]);
+            }
+            continue;
+        }
+        if (inviteSet.has(email)) {
+            const last = row.last_pending_reminder_at ? new Date(row.last_pending_reminder_at).getTime() : 0;
+            if (!last || (now - last) >= 20 * 60 * 1000) {
+                await bot.sendMessage(String(row.actor_chat_id), `هذا المستخدم لم يوافق على الدعوة حتى الان
+اسم المساحة: ${ws.name}
+ايميله: ${email}`, {
+                    reply_markup: { inline_keyboard: [[{ text: 'الغاء دعوته', callback_data: `cancel_pending_${row.id}` }]] }
+                }).catch(() => {});
+                await dbRun('UPDATE member_additions SET last_pending_reminder_at = ? WHERE id = ?', [nowIso(), row.id]);
+            }
+        }
+    }
 }
 
 async function relocateRecentMembersFromWorkspace(ws) {
@@ -2240,6 +2329,7 @@ ${text}`);
                     bot.sendMessage(chatId, `✅ تم الضغط بدقة هندسية وإلغاء الدعوة بنجاح لـ: ${textInput}
 (اضغط 🔁 لتحديث الشاشة)`);
                     await pushUpdatedWorkspaceMenu(chatId, '✅ تم تحديث عداد جميع المساحات بعد إلغاء الدعوة.').catch(() => {});
+                    await sendAdminActorNotification('تم إلغاء دعوة', chatId, (await dbGet('SELECT name FROM workspaces WHERE id = ?', [wsId])).name, normalizeEmail(textInput));
                 } else { bot.sendMessage(chatId, `❌ لم يتم العثور على الإيميل في الدعوات المعلقة (Pending invites) أو فشل الإجراء.`); }
                 await bot.deleteMessage(chatId, statusMsg.message_id).catch(()=>{}); await page.close();
             } catch (error) { bot.sendMessage(chatId, `❌ خطأ: ${error.message}`); }
@@ -2262,6 +2352,7 @@ ${text}`);
                     bot.sendMessage(chatId, `✅ تم الضغط بدقة هندسية وتمت إزالة العضو نهائياً: ${textInput}
 (اضغط 🔁 لتحديث الشاشة)`);
                     await pushUpdatedWorkspaceMenu(chatId, '✅ تم تحديث عداد جميع المساحات بعد إزالة العضو.').catch(() => {});
+                    await sendAdminActorNotification('تمت إزالة عضو', chatId, (await dbGet('SELECT name FROM workspaces WHERE id = ?', [wsId])).name, normalizeEmail(textInput));
                 } else { bot.sendMessage(chatId, `❌ لم يتم العثور على الإيميل في قائمة الأعضاء النشطين (Users) أو فشل الإجراء.`); }
                 await bot.deleteMessage(chatId, statusMsg.message_id).catch(()=>{}); await page.close();
             } catch (error) { bot.sendMessage(chatId, `❌ خطأ: ${error.message}`); }
@@ -2409,6 +2500,7 @@ async function watcherTick() {
                         }
                     }
                 }
+                await reconcileTraderRecordsForWorkspace(ws, latestMembers || foundEmails, pendingEmails).catch(() => {});
                 await syncWorkspaceStatsFromPage(ws.id, latestMembers || foundEmails, pendingEmails);
                 await page.close().catch(() => {});
             } catch (e) {}

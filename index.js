@@ -329,6 +329,60 @@ async function canInviteUsingWorkspace(wsId, actorRole, actorChatId) {
 }
 
 
+
+function getWorkspaceStatusEmoji(used) {
+    const n = Number(used || 0);
+    if (n >= 6) return '🔴';
+    if (n === 5) return '🟡';
+    if (n === 4) return '🔵';
+    return '🟢';
+}
+
+async function getWorkspaceUsedSeats(wsId) {
+    const stats = await getWorkspaceStats(wsId);
+    return Number(stats.member_count || 0) + Number(stats.invite_count || 0);
+}
+
+async function getWorkspaceButtonLabel(ws) {
+    const used = await getWorkspaceUsedSeats(ws.id);
+    const emoji = getWorkspaceStatusEmoji(used);
+    return `${emoji} ${ws.name} (${used}/${MEMBER_LIMIT})`;
+}
+
+async function getWorkspaceEmailsFromDb(wsId) {
+    const rows = await dbAll('SELECT email FROM allowed_emails WHERE ws_id = ? ORDER BY id ASC', [wsId]);
+    return [...new Set((rows || []).map(r => normalizeEmail(r.email)).filter(Boolean))];
+}
+
+async function workspaceLooksLoggedOut(page) {
+    try {
+        const url = String(page.url() || '').toLowerCase();
+        if (url.includes('/auth/login') || url.includes('/login') || url.includes('/logout')) return true;
+        const bodyText = (await page.textContent('body').catch(() => '')) || '';
+        return /log\s*in|sign\s*in|continue with google|welcome back|verify you are human/i.test(bodyText);
+    } catch (e) {
+        return true;
+    }
+}
+
+async function notifyWorkspaceLoggedOut(ws) {
+    try {
+        const current = await getWorkspaceStats(ws.id);
+        if (String(current.status || '') === 'logged_out') return;
+        const emails = await getWorkspaceEmailsFromDb(ws.id);
+        const lines = [
+            '❌ تم تسجيل خروج من المساحة.',
+            '',
+            'تعطلت المساحة!',
+            'الايميلات الذي كانو في المساحة:'
+        ];
+        if (emails.length) lines.push(...emails);
+        else lines.push('لا توجد إيميلات محفوظة.');
+        lines.push('', `ايميل المساحة: ${ws.email || '-'}`);
+        await bot.sendMessage(ws.chat_id, lines.join('\n')).catch(() => {});
+    } catch (e) {}
+}
+
 function isAdmin(chatId) {
     return String(chatId) === ADMIN_ID;
 }
@@ -451,26 +505,24 @@ async function sendMainMenu(chatId, headerText) {
         const price = Number((accessRow && accessRow.trader_price_iqd) || DEFAULT_TRADER_PRICE || 0);
         const lines = [
             headerText || `مرحبا يا أيها التاجر`,
-            'يمكنك اضافة عضو وازالة عضو والغاء دعوة'
+            'اختر المساحة التي تريد إدارتها.'
         ];
         if (count >= 7) {
             lines.push(`لقد اضفت ${count} دعوات`);
             lines.push(`المبلغ المراد دفعه هو: ${count * price} د.ع`);
         }
-        return await bot.sendMessage(chatId, lines.join('\\n'), {
-            reply_markup: { inline_keyboard: [
-                [{ text: 'اضافة عضو', callback_data: 'ws_add_person' }],
-                [{ text: 'إزالة عضو', callback_data: 'ws_remove_member' }, { text: 'إلغاء دعوة', callback_data: 'ws_revoke_invite' }],
-                [{ text: 'ملاحظة', callback_data: 'trader_note' }],
-                ...(count >= 7 ? [[{ text: '💳 تسديد الديون', callback_data: 'trader_show_payment' }]] : [])
-            ] }
-        });
+        const workspaces = await getVisibleWorkspaces(chatId);
+        const traderKeyboard = [];
+        for (const ws of workspaces) traderKeyboard.push([{ text: await getWorkspaceButtonLabel(ws), callback_data: `ws_open_${ws.id}` }]);
+        traderKeyboard.push([{ text: 'ملاحظة', callback_data: 'trader_note' }]);
+        if (count >= 7) traderKeyboard.push([{ text: '💳 تسديد الديون', callback_data: 'trader_show_payment' }]);
+        return await bot.sendMessage(chatId, lines.join('\n'), { reply_markup: { inline_keyboard: traderKeyboard } });
     }
 
     const text = headerText || 'مرحبا ببوت ادارة مساحات العمل';
     const workspaces = await getVisibleWorkspaces(chatId);
     const inline_keyboard = [];
-    for (const ws of workspaces) inline_keyboard.push([{ text: `🏢 ${ws.name}`, callback_data: `ws_open_${ws.id}` }]);
+    for (const ws of workspaces) inline_keyboard.push([{ text: await getWorkspaceButtonLabel(ws), callback_data: `ws_open_${ws.id}` }]);
 
     if (!(await isTrader(chatId))) {
         inline_keyboard.push([{ text: 'اضافة مساحة (تلقائي سريع ⚡)', callback_data: 'add_workspace_auto' }]);
@@ -1760,17 +1812,44 @@ ${text}`);
     if (state.step) {
         const textInput = text.trim(); const wsId = state.currentWsId;
         if (state.step === 'ws_awaiting_add_person') {
-            state.step = 'processing'; let statusMsg = await bot.sendMessage(chatId, '⏳ جاري البحث عن مساحة مناسبة ثم الإضافة...');
+            if (!wsId) { state.step = null; return bot.sendMessage(chatId, '❌ اختر المساحة أولاً.'); }
+            state.step = 'processing'; let statusMsg = await bot.sendMessage(chatId, '⏳ جاري إضافة الإيميل إلى المساحة المحددة...');
             try {
                 if (await isTrader(chatId) && await traderDebtBlocked(chatId)) { state.step = null; await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {}); return bot.sendMessage(chatId, '❌ لا يمكنك إضافة المزيد حتى سداد الدين.'); }
-                const actorRole = await getActorRoleValue(chatId);
-                const result = await addEmailIntoAvailableWorkspace(chatId, textInput, { actorChatId: chatId, actorRole });
+                const ws = await dbGet('SELECT * FROM workspaces WHERE id = ?', [wsId]);
+                if (!ws) throw new Error('المساحة غير موجودة.');
+                if (!fs.existsSync(ws.profile_dir)) throw new Error('ملف دخول المساحة غير موجود.');
+                const stats = await getWorkspaceStats(ws.id);
+                const used = Number(stats.member_count || 0) + Number(stats.invite_count || 0);
+                if (used >= MEMBER_LIMIT) throw new Error(`المساحة ممتلئة (${used}/${MEMBER_LIMIT}).`);
+                const exists = await dbGet('SELECT id FROM allowed_emails WHERE ws_id = ? AND email = ? LIMIT 1', [ws.id, normalizeEmail(textInput)]);
+                if (exists) throw new Error('هذا الإيميل موجود مسبقًا داخل هذه المساحة.');
+                const context = await getContext(ws.id, ws.profile_dir);
+                const page = await context.newPage();
+                await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 });
+                await sleep(900);
+                if (await workspaceLooksLoggedOut(page)) {
+                    await notifyWorkspaceLoggedOut(ws);
+                    await setWorkspaceStats(ws.id, { status: 'logged_out', last_synced_at: nowIso() });
+                    await page.close().catch(() => {});
+                    throw new Error('تم تسجيل خروج من هذه المساحة.');
+                }
+                await inviteEmailOnPage(page, normalizeEmail(textInput));
+                await dbRun('INSERT INTO allowed_emails (ws_id, email) VALUES (?, ?)', [ws.id, normalizeEmail(textInput)]);
+                await logMemberAddition(chatId, await getActorRoleValue(chatId), ws.id, normalizeEmail(textInput), 'pending');
+                const invites = [...new Set(String(stats.last_known_invites || '').split('\n').map(normalizeEmail).filter(Boolean).concat([normalizeEmail(textInput)]))];
+                await setWorkspaceStats(ws.id, {
+                    invite_count: invites.length,
+                    last_known_invites: invites.join('\n'),
+                    last_synced_at: nowIso(),
+                    status: 'ok'
+                });
+                await page.close().catch(() => {});
                 await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
-                if (result.ok) {
-                    bot.sendMessage(chatId, `✅ تمت إضافة هذا الإيميل: ${result.email}
-🏢 في هذه المساحة: ${result.workspaceName}
-📌 كم دعوة متبقية: ${result.remaining}`);
-                    await bot.sendMessage(chatId, `تم التفعيل ✅
+                bot.sendMessage(chatId, `✅ تمت إضافة هذا الإيميل: ${normalizeEmail(textInput)}
+🏢 في هذه المساحة: ${ws.name}
+📌 المستخدم الآن: ${Number(stats.member_count || 0) + invites.length}/${MEMBER_LIMIT}`);
+                await bot.sendMessage(chatId, `تم التفعيل ✅
 
 ادخل للـ Chat GPT
 
@@ -1779,19 +1858,9 @@ ${text}`);
 بعدها اكو خانة
  اسمها ( مساحة العمل) اضغط عليها
 
-ثم اضغط على ( اسم المساحة )`);
-                    if (await isTrader(chatId)) await sendTraderDebtCard(chatId);
-                } else {
-                    const reasonMap = {
-                        no_workspaces: '❌ لا توجد أي مساحة مسجلة داخل البوت.',
-                        missing_profiles: '❌ المساحات موجودة لكن ملفات الدخول الخاصة بها مفقودة أو غير صالحة.',
-                        duplicate_in_db: '❌ هذا الإيميل محفوظ مسبقًا داخل قاعدة بيانات إحدى المساحات.',
-                        no_seat_in_db: '❌ لا توجد مقاعد متاحة حسب قاعدة بيانات البوت.',
-                        invite_failed_after_selection: '❌ تم العثور على مساحة متاحة من قاعدة البيانات لكن تنفيذ الدعوة داخل المتصفح فشل. جرّب تحديث المساحة ثم أعد المحاولة.'
-                    };
-                    bot.sendMessage(chatId, reasonMap[result.reason] || '❌ لم أجد مساحة متاحة أقل من 6 أعضاء أو أن الإيميل موجود مسبقًا في كل المساحات.');
-                }
-            } catch (error) { bot.sendMessage(chatId, `❌ خطأ: ${error.message}`); }
+ثم اضغط على ( ${ws.name} )`);
+                if (await isTrader(chatId)) await sendTraderDebtCard(chatId);
+            } catch (error) { await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {}); bot.sendMessage(chatId, `❌ ${error.message}`); }
             state.step = null; return;
         }
         if (state.step === 'ws_awaiting_change_name') {
@@ -1811,8 +1880,7 @@ ${text}`);
             state.step = 'processing'; let statusMsg = await bot.sendMessage(chatId, '⏳ جاري إلغاء الدعوة...');
             try {
                 if (await isTrader(chatId)) { const own = await canTraderManageEmail(chatId, textInput); if (!own) { state.step = null; await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {}); return bot.sendMessage(chatId, '❌ لا يمكنك إلغاء دعوة لم تضفها أنت.'); } }
-                const ownerChatId = await getOwnerChatForAction(chatId); const visible = await dbAll('SELECT * FROM workspaces WHERE chat_id = ?', [ownerChatId]); let ok = false;
-                for (const ws of visible) { const context = await getContext(ws.id, ws.profile_dir); const page = await context.newPage(); await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900); if (await dynamicGeometryAction(page, textInput, 'revoke')) { ok = true; await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [ws.id, normalizeEmail(textInput)]); const stats = await getWorkspaceStats(ws.id); const invites = String(stats.last_known_invites || '').split('\n').map(normalizeEmail).filter(v => v && v !== normalizeEmail(textInput)); await setWorkspaceStats(ws.id, { invite_count: Math.max(0, invites.length), last_known_invites: invites.join('\n'), last_synced_at: nowIso() }); await page.close().catch(() => {}); break; } await page.close().catch(() => {}); }
+                const ws = await dbGet('SELECT * FROM workspaces WHERE id = ?', [wsId]); if (!ws) throw new Error('المساحة غير موجودة.'); let ok = false; const context = await getContext(ws.id, ws.profile_dir); const page = await context.newPage(); await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900); if (await workspaceLooksLoggedOut(page)) { await notifyWorkspaceLoggedOut(ws); await setWorkspaceStats(ws.id, { status: 'logged_out', last_synced_at: nowIso() }); } else if (await dynamicGeometryAction(page, textInput, 'revoke')) { ok = true; await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [ws.id, normalizeEmail(textInput)]); const stats = await getWorkspaceStats(ws.id); const invites = String(stats.last_known_invites || '').split('\n').map(normalizeEmail).filter(v => v && v !== normalizeEmail(textInput)); await setWorkspaceStats(ws.id, { invite_count: Math.max(0, invites.length), last_known_invites: invites.join('\n'), last_synced_at: nowIso() }); } await page.close().catch(() => {});
                 await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {}); if (ok) { if (await isTrader(chatId)) await markTraderEmailStatus(chatId, textInput, 'revoked'); bot.sendMessage(chatId, `✅ تم إلغاء الدعوة بنجاح لـ: ${textInput}`); } else bot.sendMessage(chatId, '❌ لم يتم العثور على الإيميل في الدعوات المعلقة أو فشل الإجراء.');
             } catch (error) { bot.sendMessage(chatId, `❌ خطأ: ${error.message}`); }
             state.step = null; return;
@@ -1821,8 +1889,7 @@ ${text}`);
             state.step = 'processing'; let statusMsg = await bot.sendMessage(chatId, '⏳ جاري إزالة العضو...');
             try {
                 if (await isTrader(chatId)) { const own = await canTraderManageEmail(chatId, textInput); if (!own) { state.step = null; await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {}); return bot.sendMessage(chatId, '❌ لا يمكنك إزالة عضو لم تضفه أنت.'); } }
-                const ownerChatId = await getOwnerChatForAction(chatId); const visible = await dbAll('SELECT * FROM workspaces WHERE chat_id = ?', [ownerChatId]); let ok = false;
-                for (const ws of visible) { const context = await getContext(ws.id, ws.profile_dir); const page = await context.newPage(); await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900); if (await dynamicGeometryAction(page, textInput, 'remove')) { ok = true; await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [ws.id, normalizeEmail(textInput)]); const stats = await getWorkspaceStats(ws.id); const members = String(stats.last_known_emails || '').split('\n').map(normalizeEmail).filter(v => v && v !== normalizeEmail(textInput)); await setWorkspaceStats(ws.id, { member_count: Math.max(0, members.length), last_known_emails: members.join('\n'), last_synced_at: nowIso() }); if (await isTrader(chatId)) { const own = await canTraderManageEmail(chatId, textInput); if (own && own.added_at && (Date.now() - new Date(own.added_at).getTime()) >= (40 * 60 * 60 * 1000)) { await reserveTraderSeat(chatId, ws.id, textInput, 40); } } await page.close().catch(() => {}); break; } await page.close().catch(() => {}); }
+                const ws = await dbGet('SELECT * FROM workspaces WHERE id = ?', [wsId]); if (!ws) throw new Error('المساحة غير موجودة.'); let ok = false; const context = await getContext(ws.id, ws.profile_dir); const page = await context.newPage(); await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900); if (await workspaceLooksLoggedOut(page)) { await notifyWorkspaceLoggedOut(ws); await setWorkspaceStats(ws.id, { status: 'logged_out', last_synced_at: nowIso() }); } else if (await dynamicGeometryAction(page, textInput, 'remove')) { ok = true; await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [ws.id, normalizeEmail(textInput)]); const stats = await getWorkspaceStats(ws.id); const members = String(stats.last_known_emails || '').split('\n').map(normalizeEmail).filter(v => v && v !== normalizeEmail(textInput)); await setWorkspaceStats(ws.id, { member_count: Math.max(0, members.length), last_known_emails: members.join('\n'), last_synced_at: nowIso() }); if (await isTrader(chatId)) { const own = await canTraderManageEmail(chatId, textInput); if (own && own.added_at && (Date.now() - new Date(own.added_at).getTime()) >= (40 * 60 * 60 * 1000)) { await reserveTraderSeat(chatId, ws.id, textInput, 40); } } } await page.close().catch(() => {});
                 await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {}); if (ok) { if (await isTrader(chatId)) await markTraderEmailStatus(chatId, textInput, 'removed'); bot.sendMessage(chatId, `✅ تمت إزالة العضو نهائياً: ${textInput}`); } else bot.sendMessage(chatId, '❌ لم يتم العثور على الإيميل في قائمة الأعضاء النشطين أو فشل الإجراء.');
             } catch (error) { bot.sendMessage(chatId, `❌ خطأ: ${error.message}`); }
             state.step = null; return;
@@ -1932,6 +1999,12 @@ async function watcherTick() {
                 const allowedEmails = new Set(allowedRows.map(r => normalizeEmail(r.email)));
                 allowedEmails.add(normalizeEmail(ws.email));
                 await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900);
+                if (await workspaceLooksLoggedOut(page)) {
+                    await notifyWorkspaceLoggedOut(ws);
+                    await setWorkspaceStats(ws.id, { status: 'logged_out', last_synced_at: nowIso() });
+                    await page.close().catch(() => {});
+                    continue;
+                }
                 let foundEmails = await extractAllEmails(page);
                 for (const email of foundEmails) {
                     const norm = normalizeEmail(email);

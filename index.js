@@ -354,14 +354,40 @@ async function getWorkspaceEmailsFromDb(wsId) {
     return [...new Set((rows || []).map(r => normalizeEmail(r.email)).filter(Boolean))];
 }
 
+function splitWorkspaceEmailsForDisplay(wsEmail, members = [], invites = []) {
+    const owner = normalizeEmail(wsEmail);
+    const uniq = arr => [...new Set((arr || []).map(normalizeEmail).filter(Boolean))];
+    return {
+        workspaceEmail: owner,
+        members: uniq(members).filter(e => e !== owner),
+        invites: uniq(invites).filter(e => e !== owner)
+    };
+}
+
 async function workspaceLooksLoggedOut(page) {
     try {
+        if (await pageLooksLoggedIn(page)) return false;
         const url = String(page.url() || '').toLowerCase();
-        if (url.includes('/auth/login') || url.includes('/login') || url.includes('/logout')) return true;
-        const bodyText = (await page.textContent('body').catch(() => '')) || '';
-        return /log\s*in|sign\s*in|continue with google|welcome back|verify you are human/i.test(bodyText);
+        if (url.includes('/auth/login') || url.includes('/logout')) return true;
+
+        const strongLoginSelectors = [
+            'input[type="email"]',
+            'input[type="password"]',
+            'button:has-text("Log in")',
+            'button:has-text("Sign in")',
+            'text="Continue with Google"',
+            'text="Welcome back"'
+        ];
+        for (const sel of strongLoginSelectors) {
+            if (await page.locator(sel).first().isVisible({ timeout: 700 }).catch(() => false)) return true;
+        }
+
+        const bodyText = ((await page.textContent('body').catch(() => '')) || '').toLowerCase();
+        const hasStrongLoginText = /continue with google|welcome back|enter your password|verify you are human/.test(bodyText);
+        const hasAdminSignals = /members|settings|invite member|invite members|pending invites/.test(bodyText);
+                return !!(hasStrongLoginText && !hasAdminSignals);
     } catch (e) {
-        return true;
+        return false;
     }
 }
 
@@ -370,15 +396,16 @@ async function notifyWorkspaceLoggedOut(ws) {
         const current = await getWorkspaceStats(ws.id);
         if (String(current.status || '') === 'logged_out') return;
         const emails = await getWorkspaceEmailsFromDb(ws.id);
+        const display = splitWorkspaceEmailsForDisplay(ws.email, emails, []);
         const lines = [
             '❌ تم تسجيل خروج من المساحة.',
             '',
             'تعطلت المساحة!',
             'الايميلات الذي كانو في المساحة:'
         ];
-        if (emails.length) lines.push(...emails);
+        if (display.members.length) lines.push(...display.members);
         else lines.push('لا توجد إيميلات محفوظة.');
-        lines.push('', `ايميل المساحة: ${ws.email || '-'}`);
+        lines.push('', `ايميل المساحة: ${display.workspaceEmail || '-'}`);
         await bot.sendMessage(ws.chat_id, lines.join('\n')).catch(() => {});
     } catch (e) {}
 }

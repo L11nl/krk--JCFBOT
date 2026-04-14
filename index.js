@@ -260,6 +260,29 @@ async function getReservedSeatsByTrader(traderChatId) {
     return await dbAll('SELECT * FROM trader_seat_reservations WHERE trader_chat_id = ? AND expires_at > ? ORDER BY id DESC', [String(traderChatId), nowIso()]);
 }
 
+
+async function rebuildWorkspaceStatsFromDatabase(wsId) {
+    const allowedRows = await dbAll('SELECT email FROM allowed_emails WHERE ws_id = ? ORDER BY id ASC', [wsId]);
+    const emails = [...new Set((allowedRows || []).map(r => normalizeEmail(r.email)).filter(Boolean))];
+    await setWorkspaceStats(wsId, {
+        member_count: 0,
+        invite_count: emails.length,
+        last_known_emails: '',
+        last_known_invites: emails.join('\n'),
+        last_synced_at: nowIso(),
+        status: 'db_rebuilt'
+    });
+    return await getWorkspaceStats(wsId);
+}
+
+async function rebuildCandidateWorkspaceStats(actorChatId, actorRole, excludeWorkspaceId = null) {
+    const list = await getCandidateWorkspacesForActor(actorChatId, actorRole, excludeWorkspaceId);
+    for (const ws of list) {
+        await rebuildWorkspaceStatsFromDatabase(ws.id).catch(() => {});
+    }
+    return list;
+}
+
 async function getFastCandidateWorkspaces(actorChatId, actorRole, excludeWorkspaceId = null) {
     const list = await getCandidateWorkspacesForActor(actorChatId, actorRole, excludeWorkspaceId);
     const reservations = actorRole === 'trader' ? await getReservedSeatsByTrader(actorChatId) : [];
@@ -992,30 +1015,40 @@ async function addEmailIntoAvailableWorkspace(actorChatId, email, opts = {}) {
     const actorRole = opts.actorRole || await getActorRoleValue(actorChatId);
     const actorChatIdNormalized = String(opts.actorChatId || actorChatId);
     const norm = normalizeEmail(email);
-    const prepared = await getFastCandidateWorkspaces(actorChatIdNormalized, actorRole, opts.excludeWorkspaceId || null);
+    let prepared = await getFastCandidateWorkspaces(actorChatIdNormalized, actorRole, opts.excludeWorkspaceId || null);
 
-    const filtered = [];
-    for (const item of prepared) {
-        const ws = item.ws;
-        const stats = item.stats || await getWorkspaceStats(ws.id);
-        const knownMembers = String(stats.last_known_emails || '').split('\n').map(normalizeEmail).filter(Boolean);
-        const knownInvites = String(stats.last_known_invites || '').split('\n').map(normalizeEmail).filter(Boolean);
-        const dbKnown = new Set([...knownMembers, ...knownInvites]);
+    const buildFiltered = async (items) => {
+        const filtered = [];
+        for (const item of items) {
+            const ws = item.ws;
+            const stats = item.stats || await getWorkspaceStats(ws.id);
+            const knownMembers = String(stats.last_known_emails || '').split('\n').map(normalizeEmail).filter(Boolean);
+            const knownInvites = String(stats.last_known_invites || '').split('\n').map(normalizeEmail).filter(Boolean);
+            const allowedRow = await dbGet('SELECT id FROM allowed_emails WHERE ws_id = ? AND email = ? LIMIT 1', [ws.id, norm]);
+            const existsByDb = !!allowedRow;
 
-        if (dbKnown.has(norm)) continue;
-        if (item.used >= MEMBER_LIMIT) continue;
-        if (!fs.existsSync(ws.profile_dir)) continue;
+            if (existsByDb) continue;
+            if (item.used >= MEMBER_LIMIT) continue;
+            if (!fs.existsSync(ws.profile_dir)) continue;
 
-        filtered.push({
-            ...item,
-            stats,
-            knownMembers,
-            knownInvites,
-            score: item.reservedForTrader ? -1000 : item.used
-        });
+            filtered.push({
+                ...item,
+                stats,
+                knownMembers,
+                knownInvites,
+                score: item.reservedForTrader ? -1000 : item.used
+            });
+        }
+        filtered.sort((a, b) => a.score - b.score || a.ws.id - b.ws.id);
+        return filtered;
+    };
+
+    let filtered = await buildFiltered(prepared);
+    if (!filtered.length && !opts._dbRebuiltOnce) {
+        await rebuildCandidateWorkspaceStats(actorChatIdNormalized, actorRole, opts.excludeWorkspaceId || null).catch(() => {});
+        prepared = await getFastCandidateWorkspaces(actorChatIdNormalized, actorRole, opts.excludeWorkspaceId || null);
+        filtered = await buildFiltered(prepared);
     }
-
-    filtered.sort((a, b) => a.score - b.score || a.ws.id - b.ws.id);
 
     for (const item of filtered) {
         const ws = item.ws;
@@ -1067,7 +1100,16 @@ async function addEmailIntoAvailableWorkspace(actorChatId, email, opts = {}) {
             await page.close().catch(() => {});
         }
     }
-    return { ok: false, email: norm };
+    const allCandidates = await getCandidateWorkspacesForActor(actorChatIdNormalized, actorRole, opts.excludeWorkspaceId || null);
+    if (!allCandidates.length) return { ok: false, email: norm, reason: 'no_workspaces' };
+    const withProfiles = allCandidates.filter(ws => fs.existsSync(ws.profile_dir));
+    if (!withProfiles.length) return { ok: false, email: norm, reason: 'missing_profiles' };
+    const duplicateRows = await dbAll('SELECT ws_id FROM allowed_emails WHERE email = ?', [norm]);
+    if ((duplicateRows || []).length) return { ok: false, email: norm, reason: 'duplicate_in_db' };
+    const candidatesAfterStats = await getFastCandidateWorkspaces(actorChatIdNormalized, actorRole, opts.excludeWorkspaceId || null);
+    const freeByDb = candidatesAfterStats.filter(x => x.used < MEMBER_LIMIT);
+    if (!freeByDb.length) return { ok: false, email: norm, reason: 'no_seat_in_db' };
+    return { ok: false, email: norm, reason: 'invite_failed_after_selection' };
 }
 
 // ================= نظام الوضع اليدوي =================
@@ -1740,7 +1782,14 @@ ${text}`);
 ثم اضغط على ( اسم المساحة )`);
                     if (await isTrader(chatId)) await sendTraderDebtCard(chatId);
                 } else {
-                    bot.sendMessage(chatId, '❌ لم أجد مساحة متاحة أقل من 6 أعضاء أو أن الإيميل موجود مسبقًا في كل المساحات.');
+                    const reasonMap = {
+                        no_workspaces: '❌ لا توجد أي مساحة مسجلة داخل البوت.',
+                        missing_profiles: '❌ المساحات موجودة لكن ملفات الدخول الخاصة بها مفقودة أو غير صالحة.',
+                        duplicate_in_db: '❌ هذا الإيميل محفوظ مسبقًا داخل قاعدة بيانات إحدى المساحات.',
+                        no_seat_in_db: '❌ لا توجد مقاعد متاحة حسب قاعدة بيانات البوت.',
+                        invite_failed_after_selection: '❌ تم العثور على مساحة متاحة من قاعدة البيانات لكن تنفيذ الدعوة داخل المتصفح فشل. جرّب تحديث المساحة ثم أعد المحاولة.'
+                    };
+                    bot.sendMessage(chatId, reasonMap[result.reason] || '❌ لم أجد مساحة متاحة أقل من 6 أعضاء أو أن الإيميل موجود مسبقًا في كل المساحات.');
                 }
             } catch (error) { bot.sendMessage(chatId, `❌ خطأ: ${error.message}`); }
             state.step = null; return;

@@ -2255,11 +2255,13 @@ ${text}`);
                     last_synced_at: nowIso(),
                     status: 'ok'
                 });
+                const freshStatsAfterAdd = await getWorkspaceStats(ws.id);
+                const freshUsedAfterAdd = Number(freshStatsAfterAdd.member_count || 0) + Number(freshStatsAfterAdd.invite_count || 0);
                 await page.close().catch(() => {});
                 await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
                 await bot.sendMessage(chatId, `✅ تمت إضافة هذا الإيميل: ${normalizeEmail(textInput)}
 🏢 في هذه المساحة: ${ws.name}
-📌 عدد الأشخاص الآن: ${Number(stats.member_count || 0) + invites.length}`);
+📌 عدد الأشخاص الآن: ${freshUsedAfterAdd}`);
                 await bot.sendMessage(chatId, `تم التفعيل ✅
 
 ادخل للـ Chat GPT
@@ -2324,12 +2326,22 @@ ${text}`);
                 const context = await getContext(wsId, (await dbGet('SELECT profile_dir FROM workspaces WHERE id = ?', [wsId])).profile_dir); const page = await context.newPage();
                 await page.goto("https://chatgpt.com/admin/members?tab=invites", { waitUntil: "domcontentloaded", timeout: 45000 }); await sleep(5000);
                 if (await dynamicGeometryAction(page, textInput, 'revoke')) {
-                    await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [wsId, normalizeEmail(textInput)]);
-                    await markTraderEmailStatus(chatId, textInput, 'revoked').catch(() => {});
+                    const normalizedEmail = normalizeEmail(textInput);
+                    await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [wsId, normalizedEmail]);
+                    await markTraderEmailStatus(chatId, normalizedEmail, 'revoked').catch(() => {});
+                    const stats = await getWorkspaceStats(wsId);
+                    const currentInvites = String(stats.last_known_invites || '').split('\n').map(normalizeEmail).filter(Boolean);
+                    const nextInvites = currentInvites.filter(e => e !== normalizedEmail);
+                    await setWorkspaceStats(wsId, {
+                        invite_count: Math.max(0, nextInvites.length),
+                        last_known_invites: nextInvites.join('\n'),
+                        last_synced_at: nowIso(),
+                        status: 'ok'
+                    });
                     bot.sendMessage(chatId, `✅ تم الضغط بدقة هندسية وإلغاء الدعوة بنجاح لـ: ${textInput}
 (اضغط 🔁 لتحديث الشاشة)`);
                     await pushUpdatedWorkspaceMenu(chatId, '✅ تم تحديث عداد جميع المساحات بعد إلغاء الدعوة.').catch(() => {});
-                    await sendAdminActorNotification('تم إلغاء دعوة', chatId, (await dbGet('SELECT name FROM workspaces WHERE id = ?', [wsId])).name, normalizeEmail(textInput));
+                    await sendAdminActorNotification('تم إلغاء دعوة', chatId, (await dbGet('SELECT name FROM workspaces WHERE id = ?', [wsId])).name, normalizedEmail);
                 } else { bot.sendMessage(chatId, `❌ لم يتم العثور على الإيميل في الدعوات المعلقة (Pending invites) أو فشل الإجراء.`); }
                 await bot.deleteMessage(chatId, statusMsg.message_id).catch(()=>{}); await page.close();
             } catch (error) { bot.sendMessage(chatId, `❌ خطأ: ${error.message}`); }
@@ -2347,12 +2359,22 @@ ${text}`);
                 const context = await getContext(wsId, (await dbGet('SELECT profile_dir FROM workspaces WHERE id = ?', [wsId])).profile_dir); const page = await context.newPage();
                 await page.goto("https://chatgpt.com/admin/members?tab=members", { waitUntil: "domcontentloaded", timeout: 45000 }); await sleep(5000);
                 if (await dynamicGeometryAction(page, textInput, 'remove')) {
-                    await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [wsId, normalizeEmail(textInput)]);
-                    await markTraderEmailStatus(chatId, textInput, 'removed').catch(() => {});
+                    const normalizedEmail = normalizeEmail(textInput);
+                    await dbRun('DELETE FROM allowed_emails WHERE ws_id = ? AND email = ?', [wsId, normalizedEmail]);
+                    await markTraderEmailStatus(chatId, normalizedEmail, 'removed').catch(() => {});
+                    const stats = await getWorkspaceStats(wsId);
+                    const currentMembers = String(stats.last_known_emails || '').split('\n').map(normalizeEmail).filter(Boolean);
+                    const nextMembers = currentMembers.filter(e => e !== normalizedEmail);
+                    await setWorkspaceStats(wsId, {
+                        member_count: Math.max(0, nextMembers.length),
+                        last_known_emails: nextMembers.join('\n'),
+                        last_synced_at: nowIso(),
+                        status: 'ok'
+                    });
                     bot.sendMessage(chatId, `✅ تم الضغط بدقة هندسية وتمت إزالة العضو نهائياً: ${textInput}
 (اضغط 🔁 لتحديث الشاشة)`);
                     await pushUpdatedWorkspaceMenu(chatId, '✅ تم تحديث عداد جميع المساحات بعد إزالة العضو.').catch(() => {});
-                    await sendAdminActorNotification('تمت إزالة عضو', chatId, (await dbGet('SELECT name FROM workspaces WHERE id = ?', [wsId])).name, normalizeEmail(textInput));
+                    await sendAdminActorNotification('تمت إزالة عضو', chatId, (await dbGet('SELECT name FROM workspaces WHERE id = ?', [wsId])).name, normalizedEmail);
                 } else { bot.sendMessage(chatId, `❌ لم يتم العثور على الإيميل في قائمة الأعضاء النشطين (Users) أو فشل الإجراء.`); }
                 await bot.deleteMessage(chatId, statusMsg.message_id).catch(()=>{}); await page.close();
             } catch (error) { bot.sendMessage(chatId, `❌ خطأ: ${error.message}`); }
@@ -2450,9 +2472,9 @@ async function watcherTick() {
                 const context = await getContext(ws.id, ws.profile_dir);
                 let page = await context.newPage();
                 if (allowedRows.length === 0) {
-                    await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(1000);
+                    await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(4000);
                     let members = await extractAllEmails(page);
-                    await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(1000);
+                    await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(4000);
                     let invites = await extractAllEmails(page);
                     let all = [...new Set([...members, ...invites])];
                     for (let e of all) await dbRun('INSERT INTO allowed_emails (ws_id, email) VALUES (?, ?)', [ws.id, normalizeEmail(e)]);
@@ -2464,7 +2486,7 @@ async function watcherTick() {
                 const trustedRows = await dbAll(`SELECT email FROM member_additions WHERE workspace_id = ? AND status IN ('pending','member','migrated')`, [ws.id]);
                 for (const row of trustedRows) allowedEmails.add(normalizeEmail(row.email));
                 allowedEmails.add(normalizeEmail(ws.email));
-                await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900);
+                await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(5000);
                 if (await workspaceLooksLoggedOut(page)) {
                     const relogin = await tryRestoreWorkspaceSession(ws, 'watcher');
                     await page.close().catch(() => {});
@@ -2487,7 +2509,7 @@ async function watcherTick() {
                     }
                 }
                 const latestMembers = await extractAllEmails(page).catch(() => foundEmails);
-                await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(900);
+                await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 }); await sleep(4000);
                 let pendingEmails = await extractAllEmails(page);
                 for (const email of pendingEmails) {
                     const norm = normalizeEmail(email);

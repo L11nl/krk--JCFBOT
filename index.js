@@ -1278,49 +1278,13 @@ async function findFirstVisibleLocator(page, selectors = [], timeout = 2000) {
 }
 
 async function inviteEmailOnPage(page, email) {
-    const inviteSelectors = [
-        'button:has-text("Invite member")',
-        'button:has-text("Invite members")',
-        '[role="button"]:has-text("Invite member")',
-        '[role="button"]:has-text("Invite members")',
-        'button[aria-label*="Invite" i]',
-        '[role="button"][aria-label*="Invite" i]'
-    ];
-    const inviteClicked = await clickFirstVisible(page, inviteSelectors, 4500) ||
-        await clickByTextRegex(page, /invite\s+member|invite\s+members|invite/i);
-    if (!inviteClicked) throw new Error('زر الدعوة غير ظاهر');
-
-    await sleep(1100);
-    const input = await findFirstVisibleLocator(page, [
-        'input[type="email"]',
-        'textarea[placeholder*="email" i]',
-        'input[placeholder*="email" i]',
-        'textarea',
-        '[role="dialog"] input',
-        '[role="dialog"] textarea'
-    ], 4500);
-    if (!input) throw new Error('حقل الإيميل غير ظاهر');
-    await input.click({ force: true }).catch(() => {});
-    await input.fill('').catch(() => {});
-    await page.keyboard.type(email, { delay: typeDelay(30) });
-    await sleep(500);
-
-    const sendSelectors = [
-        'button:has-text("Send invites")',
-        'button:has-text("Send invite")',
-        '[role="button"]:has-text("Send invites")',
-        '[role="button"]:has-text("Send invite")',
-        'button:has-text("Send")',
-        '[role="button"]:has-text("Send")',
-        'button[aria-label*="Send" i]',
-        '[role="button"][aria-label*="Send" i]'
-    ];
-    const sendClicked = await clickFirstVisible(page, sendSelectors, 3500) ||
-        await clickByTextRegex(page, /send\s+invite|send\s+invites|send/i);
-    if (!sendClicked) {
-        await page.keyboard.press('Enter').catch(() => {});
-    }
-    await sleep(1800);
+    await page.locator('button:has-text("Invite member"), button:has-text("Invite members")').first().click({ force: true });
+    await sleep(2000);
+    await page.locator('input[type="email"], textarea[placeholder*="email" i], input[placeholder*="email" i]').first().click({ force: true });
+    await page.keyboard.type(email, { delay: 50 });
+    await sleep(1000);
+    await page.locator('button:has-text("Send invites"), button:has-text("Send invite")').first().click({ force: true });
+    await sleep(4000);
 }
 
 async function addEmailIntoAvailableWorkspace(actorChatId, email, opts = {}) {
@@ -2174,16 +2138,16 @@ ${text}`);
                 if (exists) throw new Error('هذا الإيميل موجود مسبقًا داخل هذه المساحة.');
                 const context = await getContext(ws.id, ws.profile_dir);
                 let page = await context.newPage();
-                await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 });
-                await sleep(900);
+                await page.goto('https://chatgpt.com/admin/members', { waitUntil: 'domcontentloaded', timeout: 45000 });
+                await sleep(5000);
                 if (await workspaceLooksLoggedOut(page)) {
                     const relogin = await tryRestoreWorkspaceSession(ws, 'manual_add');
                     if (!relogin.ok) {
                         await page.close().catch(() => {});
                         throw new Error('تم تسجيل خروج من هذه المساحة وفشل البوت في استرجاع الدخول لها.');
                     }
-                    await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 });
-                    await sleep(900);
+                    await page.goto('https://chatgpt.com/admin/members', { waitUntil: 'domcontentloaded', timeout: 45000 });
+                    await sleep(5000);
                 }
                 const normalizedTarget = normalizeEmail(textInput);
                 const existingAllowed = await dbGet('SELECT id FROM allowed_emails WHERE ws_id = ? AND email = ? LIMIT 1', [ws.id, normalizedTarget]);
@@ -2390,8 +2354,8 @@ async function watcherTick() {
                     if (!relogin.ok) continue;
                     const recoveredContext = await getContext(ws.id, ws.profile_dir);
                     page = await recoveredContext.newPage();
-                    await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 });
-                    await sleep(900);
+                    await page.goto('https://chatgpt.com/admin/members', { waitUntil: 'domcontentloaded', timeout: 45000 });
+                    await sleep(5000);
                 }
                 let foundEmails = await extractAllEmails(page);
                 for (const email of foundEmails) {

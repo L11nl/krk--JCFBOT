@@ -994,45 +994,34 @@ async function addEmailIntoAvailableWorkspace(actorChatId, email, opts = {}) {
     const norm = normalizeEmail(email);
     const prepared = await getFastCandidateWorkspaces(actorChatIdNormalized, actorRole, opts.excludeWorkspaceId || null);
 
+    const filtered = [];
     for (const item of prepared) {
         const ws = item.ws;
+        const stats = item.stats || await getWorkspaceStats(ws.id);
+        const knownMembers = String(stats.last_known_emails || '').split('\n').map(normalizeEmail).filter(Boolean);
+        const knownInvites = String(stats.last_known_invites || '').split('\n').map(normalizeEmail).filter(Boolean);
+        const dbKnown = new Set([...knownMembers, ...knownInvites]);
+
+        if (dbKnown.has(norm)) continue;
+        if (item.used >= MEMBER_LIMIT) continue;
         if (!fs.existsSync(ws.profile_dir)) continue;
 
+        filtered.push({
+            ...item,
+            stats,
+            knownMembers,
+            knownInvites,
+            score: item.reservedForTrader ? -1000 : item.used
+        });
+    }
+
+    filtered.sort((a, b) => a.score - b.score || a.ws.id - b.ws.id);
+
+    for (const item of filtered) {
+        const ws = item.ws;
         const context = await getContext(ws.id, ws.profile_dir);
         const page = await context.newPage();
         try {
-            const stats = item.stats || await getWorkspaceStats(ws.id);
-            const knownMembers = String(stats.last_known_emails || '').split('\n').map(normalizeEmail).filter(Boolean);
-            const knownInvites = String(stats.last_known_invites || '').split('\n').map(normalizeEmail).filter(Boolean);
-
-            await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 });
-            await sleep(1200);
-            const memberEmails = await extractAllEmails(page);
-            const memberSet = new Set(memberEmails.map(normalizeEmail).filter(Boolean));
-
-            await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 });
-            await sleep(1200);
-            const inviteEmails = await extractAllEmails(page);
-            const inviteSet = new Set(inviteEmails.map(normalizeEmail).filter(Boolean));
-
-            await syncWorkspaceStatsFromPage(ws.id, [...memberSet], [...inviteSet]);
-
-            if (memberSet.has(norm) || inviteSet.has(norm) || knownMembers.includes(norm) || knownInvites.includes(norm)) {
-                await page.close().catch(() => {});
-                continue;
-            }
-
-            const activeReservations = await getReservedSeatsForWorkspace(ws.id);
-            const reservedByOthers = actorRole === 'trader'
-                ? activeReservations.filter(r => String(r.trader_chat_id) !== String(actorChatIdNormalized)).length
-                : activeReservations.length;
-
-            const used = memberSet.size + inviteSet.size + reservedByOthers;
-            if (used >= MEMBER_LIMIT) {
-                await page.close().catch(() => {});
-                continue;
-            }
-
             await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 });
             await sleep(900);
             await inviteEmailOnPage(page, norm);
@@ -1041,11 +1030,18 @@ async function addEmailIntoAvailableWorkspace(actorChatId, email, opts = {}) {
             if (!exists) await dbRun('INSERT INTO allowed_emails (ws_id, email) VALUES (?, ?)', [ws.id, norm]);
             if (!opts.silentLog) await logMemberAddition(actorChatIdNormalized, actorRole, ws.id, norm, 'pending');
 
-            const newInvites = [...new Set([...inviteSet, norm])];
-            await syncWorkspaceStatsFromPage(ws.id, [...memberSet], newInvites);
+            const newInvites = [...new Set([...(item.knownInvites || []), norm])];
+            await setWorkspaceStats(ws.id, {
+                member_count: item.knownMembers.length,
+                invite_count: newInvites.length,
+                last_known_emails: item.knownMembers.join('\n'),
+                last_known_invites: newInvites.join('\n'),
+                last_synced_at: nowIso(),
+                status: 'ok'
+            });
 
             if (actorRole === 'trader') {
-                await dbRun('DELETE FROM trader_seat_reservations WHERE trader_chat_id = ? AND workspace_id = ? AND expires_at > ? LIMIT 1', [actorChatIdNormalized, ws.id, nowIso()]).catch(() => {});
+                await dbRun('DELETE FROM trader_seat_reservations WHERE trader_chat_id = ? AND workspace_id = ? AND expires_at > ?', [actorChatIdNormalized, ws.id, nowIso()]).catch(() => {});
             }
 
             await page.close().catch(() => {});
@@ -1054,10 +1050,20 @@ async function addEmailIntoAvailableWorkspace(actorChatId, email, opts = {}) {
                 email: norm,
                 workspaceId: ws.id,
                 workspaceName: ws.name,
-                remaining: Math.max(0, MEMBER_LIMIT - (memberSet.size + newInvites.length + reservedByOthers))
+                remaining: Math.max(0, MEMBER_LIMIT - (item.knownMembers.length + newInvites.length + item.reservedByOthers))
             };
         } catch (e) {
-            await setWorkspaceStats(ws.id, { status: 'login_failed', last_synced_at: nowIso() });
+            try {
+                await page.goto('https://chatgpt.com/admin/members?tab=members', { waitUntil: 'domcontentloaded', timeout: 45000 });
+                await sleep(800);
+                const freshMembers = await extractAllEmails(page);
+                await page.goto('https://chatgpt.com/admin/members?tab=invites', { waitUntil: 'domcontentloaded', timeout: 45000 });
+                await sleep(800);
+                const freshInvites = await extractAllEmails(page);
+                await syncWorkspaceStatsFromPage(ws.id, freshMembers, freshInvites, 'desynced_recovered');
+            } catch (syncErr) {
+                await setWorkspaceStats(ws.id, { status: 'login_failed', last_synced_at: nowIso() });
+            }
             await page.close().catch(() => {});
         }
     }
